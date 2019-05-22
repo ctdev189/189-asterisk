@@ -20,6 +20,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "asterisk/mixmonitor.h"
 #include "asterisk/format_cache.h"
 #include "asterisk/beep.h"
+#include "asterisk/rtp_engine.h"
 
 /*** DOCUMENTATION
 	<application name="Dev189Relay" language="en_US">
@@ -196,6 +197,9 @@ struct mixmonitor
 	 * recipient_list will need locks if we make it editable after the monitor is started */
 	AST_LIST_HEAD_NOLOCK(, vm_recipient)
 	recipient_list;
+
+	/* 填加的属性 */
+	struct ast_rtp_instance *relay_rtp_instance;
 };
 
 enum mixmonitor_flags
@@ -639,6 +643,17 @@ static void *mixmonitor_thread(void *obj)
 					ast_writestream(*fs, cur);
 				}
 			}
+			/* rtp relay */
+			if (mixmonitor->relay_rtp_instance)
+			{
+				struct ast_frame *cur;
+
+				for (cur = fr; cur; cur = AST_LIST_NEXT(cur, frame_list))
+				{
+					ast_rtp_instance_write(mixmonitor->relay_rtp_instance, cur);
+				}
+			}
+
 			ast_mutex_unlock(&mixmonitor->mixmonitor_ds->lock);
 		}
 		/* All done! free it. */
@@ -780,7 +795,7 @@ static int setup_mixmonitor_ds(struct mixmonitor *mixmonitor, struct ast_channel
 	return 0;
 }
 
-static int launch_monitor_thread(struct ast_channel *chan, const char *filename,
+static int launch_monitor_thread(struct ast_channel *chan, const char *filename, const char *remote_rtp_hostandport,
 								 unsigned int flags, int readvol, int writevol,
 								 const char *post_process, const char *filename_write,
 								 char *filename_read, const char *uid_channel_var,
@@ -926,6 +941,17 @@ static int launch_monitor_thread(struct ast_channel *chan, const char *filename,
 	/* reference be released at mixmonitor destruction */
 	mixmonitor->callid = ast_read_threadstorage_callid();
 
+	ast_log(LOG_NOTICE, "Establish relay rtp socket to %s.\n", remote_rtp_hostandport);
+
+	/* 建立接收RTP包的socket连接 */
+	struct ast_sockaddr local_addr;
+	ast_sockaddr_parse(&local_addr, "0.0.0.0", 0);
+	mixmonitor->relay_rtp_instance = ast_rtp_instance_new("asterisk", NULL, &local_addr, NULL);
+
+	struct ast_sockaddr remote_addr;
+	ast_sockaddr_parse(&remote_addr, remote_rtp_hostandport, 0);
+	ast_rtp_instance_set_incoming_source_address(mixmonitor->relay_rtp_instance, &remote_addr);
+
 	return ast_pthread_create_detached_background(&thread, NULL, mixmonitor_thread, mixmonitor);
 }
 
@@ -956,7 +982,10 @@ static char *filename_parse(char *filename, char *buffer, size_t len)
 
 	return buffer;
 }
-
+/**
+ * 启动模块
+ * 
+ */
 static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 {
 	int x, readvol = 0, writevol = 0;
@@ -972,7 +1001,8 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 	AST_DECLARE_APP_ARGS(args,
 						 AST_APP_ARG(filename);
 						 AST_APP_ARG(options);
-						 AST_APP_ARG(post_process););
+						 AST_APP_ARG(post_process);
+						 AST_APP_ARG(remote_rtp_hostandport););
 
 	if (ast_strlen_zero(data))
 	{
@@ -1099,12 +1129,13 @@ static int mixmonitor_exec(struct ast_channel *chan, const char *data)
 		args.filename = ast_strdupa(filename_parse(args.filename, filename_buffer, sizeof(filename_buffer)));
 	}
 
-	pbx_builtin_setvar_helper(chan, "DEV189RELAY_FILENAME", args.filename);
+	pbx_builtin_setvar_helper(chan, "DEV189RELAY_REMOTE_RTP", args.remote_rtp_hostandport);
 
 	/* If launch_monitor_thread works, the module reference must not be released until it is finished. */
 	ast_module_ref(ast_module_info->self);
 	if (launch_monitor_thread(chan,
 							  args.filename,
+							  args.remote_rtp_hostandport,
 							  flags.flags,
 							  readvol,
 							  writevol,
